@@ -28,8 +28,7 @@ use std::sync::Arc;
 use hashmap::HashMap;
 use shared::Shared;
 
-pub use nodes::btree::Iter;
-use nodes::btree::{Insert, Node, Remove};
+use nodes::btree::{self, Insert, Node, OrdValue, Remove};
 
 /// Construct a map from a sequence of key/value pairs.
 ///
@@ -62,6 +61,32 @@ macro_rules! ordmap {
     }};
 }
 
+struct OrdMapValue<K, V> {
+    key: Arc<K>,
+    value: Arc<V>,
+}
+
+impl<K, V> Clone for OrdMapValue<K, V> {
+    fn clone(&self) -> Self {
+        OrdMapValue {
+            key: self.key.clone(),
+            value: self.value.clone(),
+        }
+    }
+}
+
+impl<K: Ord, V> OrdValue for OrdMapValue<K, V> {
+    type Key = K;
+
+    fn extract_key(&self) -> &K {
+        &self.key
+    }
+
+    fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.value, &other.value) && Arc::ptr_eq(&self.key, &other.key)
+    }
+}
+
 /// # Ordered Map
 ///
 /// An immutable ordered map implemented as a B-tree.
@@ -75,12 +100,14 @@ macro_rules! ordmap {
 ///
 /// [hashmap::HashMap]: ../hashmap/struct.HashMap.html
 /// [std::cmp::Ord]: https://doc.rust-lang.org/std/cmp/trait.Ord.html
-pub struct OrdMap<K, V>(Node<K, V>);
+pub struct OrdMap<K, V> {
+    root: Node<OrdMapValue<K, V>>,
+}
 
 impl<K, V> OrdMap<K, V> {
     /// Construct an empty map.
     pub fn new() -> Self {
-        OrdMap(Node::new())
+        OrdMap { root: Node::new() }
     }
 
     /// Construct a map with a single mapping.
@@ -104,7 +131,12 @@ impl<K, V> OrdMap<K, V> {
         RK: Shared<K>,
         RV: Shared<V>,
     {
-        OrdMap(Node::singleton(key.shared(), value.shared()))
+        OrdMap {
+            root: Node::singleton(OrdMapValue {
+                key: key.shared(),
+                value: value.shared(),
+            }),
+        }
     }
 
     /// Test whether a map is empty.
@@ -130,21 +162,6 @@ impl<K, V> OrdMap<K, V> {
         self.len() == 0
     }
 
-    /// Get an iterator over the key/value pairs of a map.
-    pub fn iter(&self) -> Iter<K, V> {
-        Iter::new(&self.0)
-    }
-
-    /// Get an iterator over a map's keys.
-    pub fn keys(&self) -> Keys<K, V> {
-        Keys { it: self.iter() }
-    }
-
-    /// Get an iterator over a map's values.
-    pub fn values(&self) -> Values<K, V> {
-        Values { it: self.iter() }
-    }
-
     /// Get the size of a map.
     ///
     /// Time: O(1)
@@ -164,7 +181,7 @@ impl<K, V> OrdMap<K, V> {
     /// ```
     #[inline]
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.root.len()
     }
 
     /// Get the largest key in a map, along with its value. If the map
@@ -187,7 +204,7 @@ impl<K, V> OrdMap<K, V> {
     /// # }
     /// ```
     pub fn get_max(&self) -> Option<(Arc<K>, Arc<V>)> {
-        self.0.max().map(|p| (p.key.clone(), p.value.clone()))
+        self.root.max().map(|p| (p.key.clone(), p.value.clone()))
     }
 
     /// Get the smallest key in a map, along with its value. If the
@@ -210,11 +227,26 @@ impl<K, V> OrdMap<K, V> {
     /// # }
     /// ```
     pub fn get_min(&self) -> Option<(Arc<K>, Arc<V>)> {
-        self.0.min().map(|p| (p.key.clone(), p.value.clone()))
+        self.root.min().map(|p| (p.key.clone(), p.value.clone()))
     }
 }
 
 impl<K: Ord, V> OrdMap<K, V> {
+    /// Get an iterator over the key/value pairs of a map.
+    pub fn iter(&self) -> Iter<K, V> {
+        Iter::new(self)
+    }
+
+    /// Get an iterator over a map's keys.
+    pub fn keys(&self) -> Keys<K, V> {
+        Keys { it: self.iter() }
+    }
+
+    /// Get an iterator over a map's values.
+    pub fn values(&self) -> Values<K, V> {
+        Values { it: self.iter() }
+    }
+
     /// Get the value for a key from a map.
     ///
     /// Time: O(log n)
@@ -234,7 +266,7 @@ impl<K: Ord, V> OrdMap<K, V> {
     /// # }
     /// ```
     pub fn get(&self, k: &K) -> Option<Arc<V>> {
-        self.0.lookup(k)
+        self.root.lookup(k).map(|item| item.value)
     }
 
     /// Get the value for a key from a map, or a default value if the
@@ -351,12 +383,14 @@ impl<K: Ord, V> OrdMap<K, V> {
         self.insert_ref(k.shared(), v.shared())
     }
 
-    fn insert_ref(&self, k: Arc<K>, v: Arc<V>) -> Self {
-        match self.0.insert(k, v) {
+    fn insert_ref(&self, key: Arc<K>, value: Arc<V>) -> Self {
+        match self.root.insert(OrdMapValue { key, value }) {
             Insert::NoChange => self.clone(),
             Insert::JustInc => unreachable!(),
-            Insert::Update(root) => OrdMap(root),
-            Insert::Split(left, median, right) => OrdMap(Node::from_split(left, median, right)),
+            Insert::Update(root) => OrdMap { root },
+            Insert::Split(left, median, right) => OrdMap {
+                root: Node::from_split(left, median, right),
+            },
         }
     }
 
@@ -398,11 +432,11 @@ impl<K: Ord, V> OrdMap<K, V> {
         self.insert_mut_ref(k.shared(), v.shared())
     }
 
-    fn insert_mut_ref(&mut self, k: Arc<K>, v: Arc<V>) {
-        match self.0.insert_mut(k, v) {
+    fn insert_mut_ref(&mut self, key: Arc<K>, value: Arc<V>) {
+        match self.root.insert_mut(OrdMapValue { key, value }) {
             Insert::NoChange | Insert::JustInc => {}
-            Insert::Update(root) => self.0 = root,
-            Insert::Split(left, median, right) => self.0 = Node::from_split(left, median, right),
+            Insert::Update(root) => self.root = root,
+            Insert::Split(left, median, right) => self.root = Node::from_split(left, median, right),
         }
     }
 
@@ -623,10 +657,10 @@ impl<K: Ord, V> OrdMap<K, V> {
     ///
     /// Time: O(log n)
     pub fn pop_with_key(&self, k: &K) -> Option<(Arc<K>, Arc<V>, Self)> {
-        match self.0.remove(k) {
+        match self.root.remove(k) {
             Remove::NoChange => None,
             Remove::Removed(_) => unreachable!(),
-            Remove::Update(pair, root) => Some((pair.key, pair.value, OrdMap(root))),
+            Remove::Update(pair, root) => Some((pair.key, pair.value, OrdMap { root })),
         }
     }
 
@@ -639,11 +673,11 @@ impl<K: Ord, V> OrdMap<K, V> {
     ///
     /// Time: O(log n)
     pub fn pop_with_key_mut(&mut self, k: &K) -> Option<(Arc<K>, Arc<V>)> {
-        match self.0.remove_mut(k) {
+        match self.root.remove_mut(k) {
             Remove::NoChange => None,
             Remove::Removed(pair) => Some((pair.key, pair.value)),
             Remove::Update(pair, root) => {
-                self.0 = root;
+                self.root = root;
                 Some((pair.key, pair.value))
             }
         }
@@ -896,7 +930,7 @@ impl<K: Ord, V> OrdMap<K, V> {
 
     /// Construct a map with the `n` smallest keys removed from a
     /// given map.
-    pub fn drop(&self, n: usize) -> Self {
+    pub fn skip(&self, n: usize) -> Self {
         self.iter().skip(n).collect()
     }
 
@@ -971,7 +1005,9 @@ impl<K: Ord, V> OrdMap<K, V> {
 
 impl<K, V> Clone for OrdMap<K, V> {
     fn clone(&self) -> Self {
-        OrdMap(self.0.clone())
+        OrdMap {
+            root: self.root.clone(),
+        }
     }
 }
 
@@ -998,7 +1034,7 @@ where
     K: Ord,
 {
     fn eq(&self, other: &Self) -> bool {
-        self.0.ptr_eq(&other.0) || (self.len() == other.len() && self.iter().eq(other.iter()))
+        self.root.ptr_eq(&other.root) || (self.len() == other.len() && self.iter().eq(other.iter()))
     }
 }
 
@@ -1104,6 +1140,38 @@ where
 }
 
 // Iterators
+
+pub struct Iter<K, V> {
+    it: btree::Iter<OrdMapValue<K, V>>,
+}
+
+impl<K: Ord, V> Iter<K, V> {
+    fn new(map: &OrdMap<K, V>) -> Self {
+        Iter {
+            it: btree::Iter::new(&map.root),
+        }
+    }
+}
+
+impl<K: Ord, V> Iterator for Iter<K, V> {
+    type Item = (Arc<K>, Arc<V>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.it.next().map(|item| (item.key, item.value))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.it.size_hint()
+    }
+}
+
+impl<K: Ord, V> DoubleEndedIterator for Iter<K, V> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.it.next_back().map(|item| (item.key, item.value))
+    }
+}
+
+impl<K: Ord, V> ExactSizeIterator for Iter<K, V> {}
 
 pub struct Keys<K, V> {
     it: Iter<K, V>,
